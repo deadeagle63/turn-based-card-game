@@ -1,11 +1,16 @@
+import { BrowserRouter, Routes, Route } from "react-router-dom";
+import MainMenu from "./pages/MainMenu.tsx";
+import PlayGame from "./pages/PlayGame.tsx";
 
 function App() {
-
   return (
-    <>
-      <div className={'justify-center'}><p className={"font-bold text-2xl"}>Tailwind is working!!</p></div>
-    </>
-  )
+    <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<MainMenu />} />
+        <Route path="/play" element={<PlayGame />} />
+      </Routes>
+    </BrowserRouter>
+  );
 }
 
-export default App
+export default App;
