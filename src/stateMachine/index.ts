@@ -1,23 +1,44 @@
-import { assign, createActor, setup } from "xstate";
+import {assign, createActor, fromCallback, setup} from "xstate";
 import {
+    assignPlayerColors,
+    buildBestChain,
+    canPlayCard,
     createDeck,
     dealCards,
-    handValue,
+    getPlayableCards,
     orderChain,
     shuffle,
-
 } from "../helpers/game.helper.ts";
-import {type Card, SUPPORTED_GAME_TIMES} from "../helpers/game.constants.ts";
-
-// ── Types ────────────────────────────────────────────────────────────────────
+import {type Card, CARDS_PER_PLAYER, DEFAULT_ROUND_TIME, HUMAN_ID, TICK_MS} from "../helpers/game.constants.ts";
+import {
+    applyDrawCard,
+    applyPlayCards,
+    currentPlayableCards,
+    currentPlayer,
+    currentPlayerIsCpu,
+    currentPlayerIsHuman,
+    findEmptyHandWinner,
+    findLowestHandPlayer,
+    isDrawPileEmptyWithWinner,
+    loadPersistedSnapshot,
+    persistSnapshot,
+    selectedCards,
+    shouldPersistSnapshot,
+    snapshotLooksLikePlaying,
+    topDiscard
+} from "./stateMachine.helper.ts";
+import {GAME_ACTOR_GLOBAL_KEY, GAME_SNAPSHOT_GLOBAL_KEY, PERSIST_THROTTLE_MS} from "./stateMachine.constants.ts";
 
 export type { Card };
 
 export type PlayerId = string;
 
+export type PlayerController = "human" | "cpu";
+
 export type Player = {
     id: PlayerId;
     hand: Card[];
+    controller: PlayerController;
 };
 
 export type GameContext = {
@@ -28,107 +49,63 @@ export type GameContext = {
     // players
     players: Player[];
     currentPlayerIndex: number;
+    humanPlayerId: PlayerId;
 
     // cards
     drawPile: Card[];
     discardPile: Card[];
+
+    // ui state (kept in the machine so PlayGame can be stateless)
+    selectedCardIds: string[];
+    playerColors: Record<PlayerId, string>;
+    playPageMounted: boolean;
 
     // result
     winnerId: PlayerId | null;
 };
 
 export type GameEvent =
+    | {
+          type: "GAME_CONFIG";
+          cpuCount: number;
+          roundTime: number;
+          humanPlayerId?: PlayerId;
+      }
+    | { type: "RESET_GAME" }
     | { type: "start" }
     | { type: "tick"; delta: number }
     | { type: "pause" }
     | { type: "resume" }
-    | { type: "playCards"; cardIds: string[] }
-    | { type: "drawCard" }
+    | { type: "pageMounted" }
+    | { type: "pageUnmounted" }
+    | { type: "toggleSelectCard"; cardId: string }
+    | { type: "playSelectedCards" }
+    | { type: "requestDrawCard" }
+    | { type: "playCards"; cardIds: string[] } // internal
+    | { type: "drawCard" } // internal
     | { type: "retry" }
     | { type: "quit" }
     | { type: "setRoundTime"; roundTime: number }
-    | { type: "addPlayer"; playerId: PlayerId }
+    | { type: "addPlayer"; playerId: PlayerId; controller?: PlayerController }
     | { type: "removePlayer"; playerId: PlayerId };
-
-// ── Constants ────────────────────────────────────────────────────────────────
-
-const DEFAULT_ROUND_TIME = SUPPORTED_GAME_TIMES["1m"];
-const CARDS_PER_PLAYER = 7;
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-function topDiscard(ctx: GameContext): Card | undefined {
-    return ctx.discardPile[ctx.discardPile.length - 1];
-}
-
-function currentPlayer(ctx: GameContext): Player {
-    return ctx.players[ctx.currentPlayerIndex];
-}
-
-/**
- * Check whether there are still cards available to draw
- * (either in the draw pile or by recycling the discard pile).
- */
-function canDrawCards(ctx: GameContext): boolean {
-    return (
-        ctx.drawPile.length > 0 ||
-        (ctx.drawPile.length === 0 && ctx.discardPile.length > 1)
-    );
-}
-
-/**
- * Advance to the next player.
- * When the draw pile is exhausted (can't draw), skip players with empty hands.
- * When the draw pile has cards, everyone gets a turn (empty-hand players will draw).
- * Returns -1 if all players have empty hands and no cards remain.
- */
-function advanceTurn(ctx: GameContext): number {
-    const n = ctx.players.length;
-    const drawAvailable = canDrawCards(ctx);
-    for (let i = 1; i <= n; i++) {
-        const idx = (ctx.currentPlayerIndex + i) % n;
-        if (drawAvailable || ctx.players[idx].hand.length > 0) return idx;
-    }
-    return -1; // all hands empty and no cards to draw
-}
-
-/**
- * The game ends when the draw pile is empty (and can't be recycled)
- * AND at least one player has an empty hand.
- * That player wins by being first to shed all cards after the deck ran out.
- */
-function isDrawPileEmptyWithWinner(ctx: GameContext): boolean {
-    if (canDrawCards(ctx)) return false;
-    return ctx.players.some((p) => p.hand.length === 0);
-}
-
-/**
- * Find the player with the empty hand (winner when draw pile exhausted).
- * Falls back to lowest hand value if multiple are empty.
- */
-function findEmptyHandWinner(ctx: GameContext): PlayerId | null {
-    const empty = ctx.players.find((p) => p.hand.length === 0);
-    return empty ? empty.id : findLowestHandPlayer(ctx);
-}
-
-/**
- * When the timer expires, find the player with the lowest hand value.
- */
-function findLowestHandPlayer(ctx: GameContext): PlayerId | null {
-    if (ctx.players.length === 0) return null;
-    let best = ctx.players[0];
-    for (const p of ctx.players) {
-        if (handValue(p.hand) < handValue(best.hand)) best = p;
-    }
-    return best.id;
-}
-
-// ── Machine ──────────────────────────────────────────────────────────────────
 
 export const gameMachine = setup({
     types: {
         context: {} as GameContext,
         events: {} as GameEvent,
+    },
+    actors: {
+        ticker: fromCallback(({ sendBack, input }) => {
+            const delta =
+                typeof (input as { delta?: number } | undefined)?.delta ===
+                "number"
+                    ? (input as { delta: number }).delta
+                    : TICK_MS;
+            const id = setInterval(() => {
+                sendBack({ type: "tick", delta });
+            }, delta);
+            return () => clearInterval(id);
+        }),
     },
     guards: {
         timerExpired: ({ context, event }) => {
@@ -150,8 +127,71 @@ export const gameMachine = setup({
         hasMinPlayers: ({ context }) => {
             return context.players.length >= 2;
         },
+        isHumanTurn: ({ context }) => currentPlayerIsHuman(context),
+        canPlaySelected: ({ context }) => {
+            if (!currentPlayerIsHuman(context)) return false;
+            if (context.selectedCardIds.length === 0) return false;
+            return orderChain(selectedCards(context), topDiscard(context)) !== null;
+        },
+        canHumanDraw: ({ context }) => {
+            if (!currentPlayerIsHuman(context)) return false;
+            return currentPlayableCards(context).length === 0;
+        },
+        humanShouldAutoPlaySingle: ({ context }) => {
+            if (!currentPlayerIsHuman(context)) return false;
+            if (context.selectedCardIds.length !== 0) return false;
+            return currentPlayableCards(context).length === 1;
+        },
+        humanShouldAutoDraw: ({ context }) => {
+            if (!currentPlayerIsHuman(context)) return false;
+            if (context.selectedCardIds.length !== 0) return false;
+            return currentPlayableCards(context).length === 0;
+        },
+        cpuShouldAct: ({ context }) => currentPlayerIsCpu(context),
     },
     actions: {
+        initFromConfig: assign(({ event }) => {
+            const e = event as Extract<GameEvent, { type: "GAME_CONFIG" }>;
+            const humanPlayerId = e.humanPlayerId ?? HUMAN_ID;
+            const players: Player[] = [
+                { id: humanPlayerId, hand: [], controller: "human" },
+                ...Array.from({ length: e.cpuCount }, (_, i) => ({
+                    id: `CPU ${i + 1}`,
+                    hand: [],
+                    controller: "cpu" as const,
+                })),
+            ];
+            return {
+                roundTime: e.roundTime,
+                currentTime: 0,
+                currentPlayerIndex: 0,
+                humanPlayerId,
+                players,
+                drawPile: [],
+                discardPile: [],
+                winnerId: null,
+                selectedCardIds: [],
+                playerColors: assignPlayerColors(players.map((p) => p.id)),
+            };
+        }),
+        markPlayPageMounted: assign(() => ({ playPageMounted: true })),
+        markPlayPageUnmounted: assign(() => ({
+            playPageMounted: false,
+            selectedCardIds: [],
+        })),
+        resetGame: assign(() => ({
+            currentTime: 0,
+            roundTime: DEFAULT_ROUND_TIME,
+            players: [],
+            currentPlayerIndex: 0,
+            humanPlayerId: HUMAN_ID,
+            drawPile: [],
+            discardPile: [],
+            selectedCardIds: [],
+            playerColors: {},
+            playPageMounted: false,
+            winnerId: null,
+        })),
         dealGame: assign(({ context }) => {
             const deck = shuffle(createDeck());
             const players = context.players.map((p) => ({
@@ -167,6 +207,7 @@ export const gameMachine = setup({
                 currentPlayerIndex: 0,
                 currentTime: 0,
                 winnerId: null,
+                selectedCardIds: [],
             };
         }),
         tickTimer: assign(({ context, event }) => {
@@ -177,77 +218,67 @@ export const gameMachine = setup({
         }),
         playCards: assign(({ context, event }) => {
             const e = event as { type: "playCards"; cardIds: string[] };
-            const player = currentPlayer(context);
-            const top = topDiscard(context);
-            const played = player.hand.filter((c) => e.cardIds.includes(c.id));
-            const remaining = player.hand.filter(
-                (c) => !e.cardIds.includes(c.id),
-            );
-
-            // Order the played cards as a valid chain so the last card
-            // becomes the new top of the discard pile
-            const ordered = orderChain(played, top) ?? played;
-
-            const updatedPlayers = context.players.map((p) =>
-                p.id === player.id ? { ...p, hand: remaining } : p,
-            );
-
-            const newDiscard = [...context.discardPile, ...ordered];
-
-            // Advance to next player
-            const nextCtx = { ...context, players: updatedPlayers, discardPile: newDiscard };
-            const nextIdx = advanceTurn(nextCtx);
-
-            return {
-                players: updatedPlayers,
-                discardPile: newDiscard,
-                currentPlayerIndex: nextIdx === -1
-                    ? context.currentPlayerIndex
-                    : nextIdx,
-                winnerId: null,
-            };
+            return applyPlayCards(context, e.cardIds);
         }),
         drawCard: assign(({ context }) => {
+            return applyDrawCard(context);
+        }),
+        toggleSelectedCard: assign(({ context, event }) => {
+            const e = event as { type: "toggleSelectCard"; cardId: string };
+            if (!currentPlayerIsHuman(context)) return {};
             const player = currentPlayer(context);
-            let drawPile = [...context.drawPile];
-            let discardPile = [...context.discardPile];
-
-            // If draw pile is empty, recycle the discard pile (except the top card)
-            if (drawPile.length === 0 && discardPile.length > 1) {
-                const top = discardPile[discardPile.length - 1];
-                const recycled = shuffle(discardPile.slice(0, -1));
-                drawPile = recycled;
-                discardPile = [top];
-            }
-
-            if (drawPile.length === 0) {
-                // No cards available, advance to next player with cards
-                const nextIdx = advanceTurn(context);
-                return {
-                    currentPlayerIndex: nextIdx === -1
-                        ? context.currentPlayerIndex
-                        : nextIdx,
-                };
-            }
-
-            const drawn = drawPile.shift()!;
-            const updatedPlayers = context.players.map((p) =>
-                p.id === player.id
-                    ? { ...p, hand: [...p.hand, drawn] }
-                    : p,
+            const hand = player.hand;
+            const cleanedSelection = context.selectedCardIds.filter((id) =>
+                hand.some((c) => c.id === id),
             );
 
-            const nextCtx = { ...context, players: updatedPlayers, drawPile, discardPile };
-            const nextIdx = advanceTurn(nextCtx);
+            const idx = cleanedSelection.indexOf(e.cardId);
+            if (idx !== -1) {
+                return { selectedCardIds: cleanedSelection.slice(0, idx) };
+            }
 
-            return {
-                drawPile,
-                discardPile,
-                players: updatedPlayers,
-                currentPlayerIndex: nextIdx === -1
-                    ? context.currentPlayerIndex
-                    : nextIdx,
-            };
+            const candidate = hand.find((c) => c.id === e.cardId);
+            if (!candidate) return { selectedCardIds: cleanedSelection };
+
+            const chainEnd =
+                cleanedSelection.length > 0
+                    ? hand.find(
+                          (c) =>
+                              c.id ===
+                              cleanedSelection[cleanedSelection.length - 1],
+                      )
+                    : topDiscard(context);
+
+            if (!canPlayCard(candidate, chainEnd)) {
+                return { selectedCardIds: cleanedSelection };
+            }
+
+            return { selectedCardIds: [...cleanedSelection, e.cardId] };
+        }),
+        playSelectedCards: assign(({ context }) => {
+            if (!currentPlayerIsHuman(context)) return {};
+            return applyPlayCards(context, context.selectedCardIds);
+        }),
+        cpuTakeTurn: assign(({ context }) => {
+            if (!currentPlayerIsCpu(context)) return {};
+            const player = currentPlayer(context);
+            const top = topDiscard(context);
+            const playable = getPlayableCards(player.hand, top);
+            if (playable.length === 0) return applyDrawCard(context);
+
+            const chain = buildBestChain(player.hand, top);
+            const toPlay = chain.length > 0 ? chain : [playable[0]];
+            return applyPlayCards(
+                context,
+                toPlay.map((c) => c.id),
+            );
+        }),
+        humanAutoPlaySingle: assign(({ context }) => {
+            if (!currentPlayerIsHuman(context)) return {};
+            if (context.selectedCardIds.length !== 0) return {};
+            const playable = currentPlayableCards(context);
+            if (playable.length !== 1) return {};
+            return applyPlayCards(context, [playable[0].id]);
         }),
         setTimerWinner: assign(({ context }) => ({
             winnerId: findLowestHandPlayer(context),
@@ -263,11 +294,29 @@ export const gameMachine = setup({
         roundTime: DEFAULT_ROUND_TIME,
         players: [],
         currentPlayerIndex: 0,
+        humanPlayerId: HUMAN_ID,
         drawPile: [],
         discardPile: [],
+        selectedCardIds: [],
+        playerColors: {},
+        playPageMounted: false,
         winnerId: null,
     },
     initial: "lobby",
+    on: {
+        GAME_CONFIG: {
+            target: ".playing",
+            actions: ["initFromConfig", "dealGame"],
+            reenter: true,
+        },
+        RESET_GAME: {
+            target: ".lobby",
+            actions: "resetGame",
+            reenter: true,
+        },
+        pageMounted: { actions: "markPlayPageMounted" },
+        pageUnmounted: { actions: "markPlayPageUnmounted" },
+    },
     states: {
         lobby: {
             on: {
@@ -282,7 +331,11 @@ export const gameMachine = setup({
                                 return context.players;
                             return [
                                 ...context.players,
-                                { id: event.playerId, hand: [] },
+                                {
+                                    id: event.playerId,
+                                    hand: [],
+                                    controller: event.controller ?? "cpu",
+                                },
                             ];
                         },
                     }),
@@ -310,13 +363,28 @@ export const gameMachine = setup({
         playing: {
             type: "parallel",
             on: {
-                quit: { target: "gameOver" },
+                // Quitting the PlayGame page should be resumable; the UI will
+                // navigate away and send `pageUnmounted` to stop ticking.
+                quit: { actions: "markPlayPageUnmounted" },
             },
             states: {
                 timer: {
-                    initial: "running",
+                    initial: "awaitingMount",
                     states: {
+                        awaitingMount: {
+                            always: {
+                                guard: ({ context }) => context.playPageMounted,
+                                target: "running",
+                            },
+                            on: {
+                                pageMounted: { target: "running" },
+                            },
+                        },
                         running: {
+                            invoke: {
+                                src: "ticker",
+                                input: () => ({ delta: TICK_MS }),
+                            },
                             on: {
                                 tick: [
                                     {
@@ -332,43 +400,100 @@ export const gameMachine = setup({
                                     },
                                 ],
                                 pause: { target: "paused" },
+                                pageUnmounted: { target: "awaitingMount" },
                             },
                         },
                         paused: {
                             on: {
                                 resume: { target: "running" },
+                                pageUnmounted: { target: "awaitingMount" },
                             },
                         },
                     },
                 },
                 turns: {
-                    initial: "awaitingAction",
+                    initial: "awaitingMount",
+                    on: {
+                        pause: { target: ".paused" },
+                        resume: { target: ".active" },
+                        pageUnmounted: { target: ".awaitingMount" },
+                    },
                     states: {
-                        awaitingAction: {
+                        awaitingMount: {
+                            always: {
+                                guard: ({ context }) => context.playPageMounted,
+                                target: "active",
+                            },
                             on: {
-                                playCards: {
-                                    guard: "canPlayCards",
-                                    actions: "playCards",
-                                    target: "checkEnd",
+                                pageMounted: { target: "active" },
+                            },
+                        },
+                        active: {
+                            initial: "awaitingAction",
+                            states: {
+                                awaitingAction: {
+                                    on: {
+                                        toggleSelectCard: {
+                                            guard: "isHumanTurn",
+                                            actions: "toggleSelectedCard",
+                                            reenter: true,
+                                        },
+                                        playSelectedCards: {
+                                            guard: "canPlaySelected",
+                                            actions: "playSelectedCards",
+                                            target: "checkEnd",
+                                        },
+                                        requestDrawCard: {
+                                            guard: "canHumanDraw",
+                                            actions: "drawCard",
+                                            target: "checkEnd",
+                                        },
+                                        // internal actions (CPU + forced human)
+                                        playCards: {
+                                            guard: "canPlayCards",
+                                            actions: "playCards",
+                                            target: "checkEnd",
+                                        },
+                                        drawCard: {
+                                            actions: "drawCard",
+                                            target: "checkEnd",
+                                        },
+                                    },
+                                    after: {
+                                        600: [
+                                            {
+                                                guard: "humanShouldAutoPlaySingle",
+                                                actions: "humanAutoPlaySingle",
+                                                target: "checkEnd",
+                                            },
+                                            {
+                                                guard: "humanShouldAutoDraw",
+                                                actions: "drawCard",
+                                                target: "checkEnd",
+                                            },
+                                        ],
+                                        800: {
+                                            guard: "cpuShouldAct",
+                                            actions: "cpuTakeTurn",
+                                            target: "checkEnd",
+                                        },
+                                    },
                                 },
-                                drawCard: {
-                                    actions: "drawCard",
-                                    target: "checkEnd",
+                                checkEnd: {
+                                    always: [
+                                        {
+                                            guard: "gameStalled",
+                                            target: "#game.gameOver",
+                                            actions: "setStalledWinner",
+                                        },
+                                        {
+                                            target: "awaitingAction",
+                                        },
+                                    ],
                                 },
                             },
                         },
-                        checkEnd: {
-                            always: [
-                                {
-                                    guard: "gameStalled",
-                                    target: "#game.gameOver",
-                                    actions: "setStalledWinner",
-                                },
-                                {
-                                    target: "awaitingAction",
-                                },
-                            ],
-                        },
+                        paused: {},
                     },
                 },
             },
@@ -376,19 +501,8 @@ export const gameMachine = setup({
         gameOver: {
             on: {
                 retry: {
-                    target: "lobby",
-                    actions: assign({
-                        currentTime: 0,
-                        drawPile: [],
-                        discardPile: [],
-                        currentPlayerIndex: 0,
-                        winnerId: null,
-                        players: ({ context }) =>
-                            context.players.map((p) => ({
-                                ...p,
-                                hand: [],
-                            })),
-                    }),
+                    target: "#game.playing",
+                    actions: "dealGame",
                 },
                 quit: {
                     target: "lobby",
@@ -398,6 +512,8 @@ export const gameMachine = setup({
                         discardPile: [],
                         currentPlayerIndex: 0,
                         winnerId: null,
+                        selectedCardIds: [],
+                        playerColors: {},
                         players: [],
                     }),
                 },
@@ -407,3 +523,65 @@ export const gameMachine = setup({
 });
 
 export const createGameActor = () => createActor(gameMachine);
+
+export const gameActor: ReturnType<typeof createGameActor> = (() => {
+    const g = globalThis as unknown as Record<string, unknown>;
+    const existing = g[GAME_ACTOR_GLOBAL_KEY] as
+        | ReturnType<typeof createGameActor>
+        | undefined;
+    if (existing) return existing;
+
+    const created = createActor(gameMachine, {
+        snapshot: loadPersistedSnapshot(),
+    }).start();
+    g[GAME_ACTOR_GLOBAL_KEY] = created;
+
+    if (!g[GAME_SNAPSHOT_GLOBAL_KEY]) {
+        g[GAME_SNAPSHOT_GLOBAL_KEY] = true;
+	        let timeout: ReturnType<typeof setTimeout> | null = null;
+	        created.subscribe(() => {
+	            const snapshot = created.getPersistedSnapshot();
+	            const snapshotRecord = snapshot as unknown as Record<string, unknown>;
+	            const context = snapshotRecord["context"];
+	            const playPageMounted =
+	                context &&
+	                typeof context === "object" &&
+	                !Array.isArray(context) &&
+	                (context as Record<string, unknown>)["playPageMounted"];
+
+	            // When leaving the PlayGame page, persist immediately so the menu
+	            // can show "Continue" without waiting for the throttle.
+	            if (snapshotLooksLikePlaying(snapshot) && playPageMounted === false) {
+	                if (timeout) {
+	                    clearTimeout(timeout);
+	                    timeout = null;
+	                }
+	                persistSnapshot(snapshot);
+	                return;
+	            }
+
+	            if (!shouldPersistSnapshot(snapshot)) {
+	                if (timeout) {
+	                    clearTimeout(timeout);
+	                    timeout = null;
+	                }
+                persistSnapshot(snapshot);
+                return;
+            }
+
+            if (timeout) return;
+            timeout = setTimeout(() => {
+                timeout = null;
+                persistSnapshot(created.getPersistedSnapshot());
+            }, PERSIST_THROTTLE_MS);
+        });
+
+        if (typeof window !== "undefined") {
+            window.addEventListener("beforeunload", () => {
+                persistSnapshot(created.getPersistedSnapshot());
+            });
+        }
+    }
+
+    return created;
+})();

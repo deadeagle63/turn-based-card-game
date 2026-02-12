@@ -61,3 +61,7 @@ export const PLAYER_COLORS = [
     "#9b59b6", // purple
     "#1abc9c", // teal
 ] as const;
+
+export const DEFAULT_ROUND_TIME = SUPPORTED_GAME_TIMES["3m"];
+
+export const CARDS_PER_PLAYER = 7;

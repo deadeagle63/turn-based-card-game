@@ -1,76 +1,72 @@
-import {useCallback, useEffect, useMemo, useRef, useState} from "react";
+import {useEffect, useMemo} from "react";
 import {useLocation, useNavigate} from "react-router-dom";
-import {useMachine} from "@xstate/react";
-import {type Card, gameMachine} from "../stateMachine/index.ts";
+import {useSelector} from "@xstate/react";
+import {type Card, gameActor} from "../stateMachine/index.ts";
 import {
-    assignPlayerColors,
-    buildBestChain,
     canPlayCard,
     getPlayableCards,
     handValue,
 } from "../helpers/game.helper.ts";
 import CardView from "../components/CardView.tsx";
-import {HUMAN_ID, RANK_VALUES, TICK_MS} from "../helpers/game.constants.ts";
+import {RANK_VALUES} from "../helpers/game.constants.ts";
+
+const EMPTY_HAND: Card[] = [];
 
 export default function PlayGame() {
     const navigate = useNavigate();
     const location = useLocation();
-    const { cpuCount, roundTime } = (location.state as {
-        cpuCount: number;
-        roundTime: number;
-    }) ?? { cpuCount: 1, roundTime: 60000 };
 
     // ── State machine ────────────────────────────────────────────────────────
-    const [state, send] = useMachine(gameMachine);
+    const state = useSelector(gameActor, (s) => s);
+    const send = gameActor.send;
     const ctx = state.context;
 
-    // ── Local UI state ───────────────────────────────────────────────────────
-    const [selectedChain, setSelectedChain] = useState<string[]>([]);
-    const [playerColors, setPlayerColors] = useState<Record<string, string>>({});
-    const initialized = useRef(false);
+    const configFromUrl = useMemo(() => {
+        const params = new URLSearchParams(location.search);
+        const cpuCountRaw = params.get("cpuCount");
+        const roundTimeRaw = params.get("roundTime");
+        if (!cpuCountRaw || !roundTimeRaw) return null;
+        const cpuCount = Number.parseInt(cpuCountRaw, 10);
+        const roundTime = Number.parseInt(roundTimeRaw, 10);
+        if (!Number.isFinite(cpuCount) || !Number.isFinite(roundTime)) return null;
+        if (cpuCount <= 0 || roundTime <= 0) return null;
+        return { cpuCount, roundTime };
+    }, [location.search]);
 
-    // ── Bootstrap: 1 human ("You") + N CPUs ──────────────────────────────────
+    // ── Page lifecycle ───────────────────────────────────────────────────────
     useEffect(() => {
-        if (initialized.current) return;
-        initialized.current = true;
+        send({ type: "pageMounted" });
+        return () => send({ type: "pageUnmounted" });
+    }, [send]);
 
-        send({ type: "setRoundTime", roundTime });
-
-        const ids: string[] = [HUMAN_ID];
-        send({ type: "addPlayer", playerId: HUMAN_ID });
-        for (let i = 1; i <= cpuCount; i++) {
-            const cpuId = `CPU ${i}`;
-            ids.push(cpuId);
-            send({ type: "addPlayer", playerId: cpuId });
-        }
-
-        setPlayerColors(assignPlayerColors(ids));
-        setTimeout(() => send({ type: "start" }), 0);
-    }, [cpuCount, roundTime, send]);
-
-    // ── Timer tick ───────────────────────────────────────────────────────────
     useEffect(() => {
-        if (!state.matches({ playing: { timer: "running" } })) return;
-        const id = setInterval(() => send({ type: "tick", delta: TICK_MS }), TICK_MS);
-        return () => clearInterval(id);
-    }, [state, send]);
+        if (!state.matches("lobby")) return;
+        if (!configFromUrl) return;
+        send({ type: "GAME_CONFIG", ...configFromUrl });
+    }, [configFromUrl, send, state]);
 
     // ── Derived values ───────────────────────────────────────────────────────
     const topDiscard: Card | undefined =
         ctx.discardPile[ctx.discardPile.length - 1];
     const currentPlayer = ctx.players[ctx.currentPlayerIndex];
-    const currentHand = currentPlayer?.hand ?? [];
+    const currentHand = currentPlayer?.hand ?? EMPTY_HAND;
     const playable = useMemo(
         () => getPlayableCards(currentHand, topDiscard),
         [currentHand, topDiscard],
     );
     const isPlaying = state.matches("playing");
-    const isPaused = state.matches({ playing: { timer: "paused" } });
+    const isPaused =
+        state.matches({ playing: { timer: "paused" } }) ||
+        state.matches({ playing: { turns: "paused" } });
     const isGameOver = state.matches("gameOver");
-    const isHumanTurn = currentPlayer?.id === HUMAN_ID;
+    const isHumanTurn = currentPlayer?.id === ctx.humanPlayerId;
+    const selectedChain = ctx.selectedCardIds;
+    const isTimerRunning = state.matches({ playing: { timer: "running" } });
+    const isTimerPaused = state.matches({ playing: { timer: "paused" } });
+    const canPauseResume = isTimerRunning || isTimerPaused;
 
     const currentBorderColor = currentPlayer
-        ? playerColors[currentPlayer.id] ?? "#6366f1"
+        ? ctx.playerColors[currentPlayer.id] ?? "#6366f1"
         : "#6366f1";
 
     const timeLeftSec = Math.max(
@@ -81,127 +77,17 @@ export default function PlayGame() {
     const timeLeftSecRem = timeLeftSec % 60;
     const timeDisplay = `${timeLeftMin}:${String(timeLeftSecRem).padStart(2, "0")}`;
 
-    // ── Card selection toggle ────────────────────────────────────────────────
-    const toggleCard = useCallback(
-        (cardId: string) => {
-            setSelectedChain((prev) => {
-                const idx = prev.indexOf(cardId);
-                if (idx !== -1) {
-                    // Deselecting: truncate chain from this card onwards
-                    return prev.slice(0, idx);
-                }
-                // Adding: card must match the end of the chain (or topDiscard if empty)
-                const card = currentHand.find((c: Card) => c.id === cardId);
-                if (!card) return prev;
-                const chainEnd = prev.length > 0
-                    ? currentHand.find((c: Card) => c.id === prev[prev.length - 1])
-                    : topDiscard;
-                if (!canPlayCard(card, chainEnd)) return prev;
-                return [...prev, cardId];
-            });
-        },
-        [currentHand, topDiscard],
-    );
-
-    // ── Play selected cards ──────────────────────────────────────────────────
-    const playSelectedCards = useCallback(() => {
-        if (selectedChain.length === 0) return;
-        send({ type: "playCards", cardIds: selectedChain });
-        setSelectedChain([]);
-    }, [selectedChain, send]);
-
-    // ── Handle card click: delegate to toggleCard which validates the chain ──
-    const handleCardClick = useCallback(
-        (card: Card) => {
-            toggleCard(card.id);
-        },
-        [toggleCard],
-    );
-
-    // ── Draw card (when no playable cards) ───────────────────────────────────
-    const handleDraw = useCallback(() => {
-        send({ type: "drawCard" });
-        setSelectedChain([]);
-    }, [send]);
-
     // ── SPACE key to play selected cards (human turn only) ─────────────────
     useEffect(() => {
         const onKeyDown = (e: KeyboardEvent) => {
             if (e.code === "Space" && selectedChain.length > 0 && isPlaying && isHumanTurn) {
                 e.preventDefault();
-                playSelectedCards();
+                send({ type: "playSelectedCards" });
             }
         };
         window.addEventListener("keydown", onKeyDown);
         return () => window.removeEventListener("keydown", onKeyDown);
-    }, [selectedChain, isPlaying, isHumanTurn, playSelectedCards]);
-
-    // ── Clear selection on turn change ───────────────────────────────────────
-    const prevPlayerIdx = useRef(ctx.currentPlayerIndex);
-    useEffect(() => {
-        if (ctx.currentPlayerIndex !== prevPlayerIdx.current) {
-            setSelectedChain([]);
-            prevPlayerIdx.current = ctx.currentPlayerIndex;
-        }
-    }, [ctx.currentPlayerIndex]);
-
-    // ── Keep stable refs to derived values so auto-play effects don't
-    //    reset their timer on every tick-induced re-render. ───────────────
-    const playableRef = useRef(playable);
-    playableRef.current = playable;
-    const currentHandRef = useRef(currentHand);
-    currentHandRef.current = currentHand;
-    const topDiscardRef = useRef(topDiscard);
-    topDiscardRef.current = topDiscard;
-
-    // ── Auto-play: human -- single valid card, empty hand, or forced draw ───
-    // Auto-play when only one valid card exists, hand is empty (must draw),
-    // or no playable cards (must draw). Only fires on the human player's turn.
-    // Halted while the game is paused.
-    useEffect(() => {
-        if (!isPlaying || isPaused || !isHumanTurn) return;
-
-        if (playable.length === 1) {
-            const timer = setTimeout(() => {
-                const cards = playableRef.current;
-                if (cards.length === 1) {
-                    send({ type: "playCards", cardIds: [cards[0].id] });
-                    setSelectedChain([]);
-                }
-            }, 600);
-            return () => clearTimeout(timer);
-        }
-
-        if (playable.length === 0) {
-            const timer = setTimeout(() => {
-                send({ type: "drawCard" });
-                setSelectedChain([]);
-            }, 600);
-            return () => clearTimeout(timer);
-        }
-    }, [isPlaying, isPaused, isHumanTurn, playable.length, currentHand.length, send]);
-
-    // ── Auto-play: CPU turns ─────────────────────────────────────────────────
-    // CPUs always auto-play: build the longest chain (or draw if none).
-    useEffect(() => {
-        if (!isPlaying || isPaused || isHumanTurn) return;
-
-        const timer = setTimeout(() => {
-            const current = playableRef.current;
-            if (current.length > 0) {
-                // CPU builds the longest possible chain from its hand
-                const chain = buildBestChain(currentHandRef.current, topDiscardRef.current);
-                if (chain.length > 0) {
-                    send({ type: "playCards", cardIds: chain.map((c: Card) => c.id) });
-                } else {
-                    send({ type: "playCards", cardIds: [current[0].id] });
-                }
-            } else {
-                send({ type: "drawCard" });
-            }
-        }, 800);
-        return () => clearTimeout(timer);
-    }, [isPlaying, isPaused, isHumanTurn, playable.length, currentHand.length, send]);
+    }, [selectedChain.length, isPlaying, isHumanTurn, send]);
 
     // ── Score board for game over ────────────────────────────────────────────
     const sortedPlayers = useMemo(
@@ -217,7 +103,7 @@ export default function PlayGame() {
     // Game Over screen
     if (isGameOver) {
         const winnerColor = ctx.winnerId
-            ? playerColors[ctx.winnerId] ?? "#6366f1"
+            ? ctx.playerColors[ctx.winnerId] ?? "#6366f1"
             : "#6366f1";
         return (
             <div
@@ -266,12 +152,31 @@ export default function PlayGame() {
                         Play Again
                     </button>
                     <button
-                        onClick={() => navigate("/")}
+                        onClick={() => {
+                            send({ type: "quit" });
+                            navigate("/");
+                        }}
                         className="rounded-lg bg-white/5 px-6 py-3 font-medium text-gray-400 transition-colors hover:bg-white/10 hover:text-white"
                     >
                         Main Menu
                     </button>
                 </div>
+            </div>
+        );
+    }
+
+    if (state.matches("lobby")) {
+        return (
+            <div className="flex min-h-screen w-full flex-col items-center justify-center gap-4 border-4 border-white/10">
+                <p className="text-gray-400">
+                    {configFromUrl ? "Setting up game..." : "No game configured."}
+                </p>
+                <button
+                    onClick={() => navigate("/")}
+                    className="rounded-lg bg-white/5 px-6 py-3 font-medium text-gray-300 transition-colors hover:bg-white/10 hover:text-white"
+                >
+                    Main Menu
+                </button>
             </div>
         );
     }
@@ -305,25 +210,19 @@ export default function PlayGame() {
                         {timeDisplay}
                     </span>
                     <button
-                        onClick={() =>
-                            send({
-                                type: state.matches({
-                                    playing: { timer: "running" },
-                                })
-                                    ? "pause"
-                                    : "resume",
-                            })
-                        }
+                        disabled={!canPauseResume}
+                        onClick={() => send({ type: isTimerRunning ? "pause" : "resume" })}
                         className="rounded bg-white/10 px-3 py-1 text-sm text-gray-300 transition hover:bg-white/20"
                     >
-                        {state.matches({ playing: { timer: "running" } })
-                            ? "Pause"
-                            : "Resume"}
+                        {isTimerPaused ? "Resume" : "Pause"}
                     </button>
                 </div>
 
                 <button
-                    onClick={() => navigate("/")}
+                    onClick={() => {
+                        send({ type: "pageUnmounted" });
+                        navigate("/");
+                    }}
                     className="rounded bg-white/10 px-3 py-1 text-sm text-gray-300 transition hover:bg-white/20"
                 >
                     Quit
@@ -339,7 +238,7 @@ export default function PlayGame() {
                     </h3>
                     {ctx.players.map((p) => {
                         const isActive = p.id === currentPlayer?.id;
-                        const color = playerColors[p.id] ?? "#6366f1";
+                        const color = ctx.playerColors[p.id] ?? "#6366f1";
                         return (
                             <div
                                 key={p.id}
@@ -368,7 +267,7 @@ export default function PlayGame() {
                                         )}
                                     </span>
                                     <span className="text-xs text-gray-600">
-                                        {p.id === HUMAN_ID ? "" : "CPU \u00b7 "}
+                                        {p.controller === "human" ? "" : "CPU \u00b7 "}
                                         {handValue(p.hand)} pts &middot; {p.hand.length} cards
                                     </span>
                                 </div>
@@ -405,7 +304,7 @@ export default function PlayGame() {
                     <div className="mb-4 flex flex-wrap justify-center gap-2 md:hidden">
                         {ctx.players.map((p) => {
                             const isActive = p.id === currentPlayer?.id;
-                            const color = playerColors[p.id] ?? "#6366f1";
+                            const color = ctx.playerColors[p.id] ?? "#6366f1";
                             return (
                                 <div
                                     key={p.id}
@@ -430,10 +329,10 @@ export default function PlayGame() {
                     <div className="mb-6 flex flex-1 items-center justify-center gap-8">
                         {/* Draw pile */}
                         <button
-                            onClick={handleDraw}
-                            disabled={hasPlayableCards}
+                            onClick={() => send({ type: "requestDrawCard" })}
+                            disabled={!isHumanTurn || isPaused || hasPlayableCards}
                             className={`flex h-28 w-20 items-center justify-center rounded-lg border-2 shadow-md transition-all ${
-                                !hasPlayableCards
+                                isHumanTurn && !isPaused && !hasPlayableCards
                                     ? "border-yellow-400 bg-indigo-900 shadow-yellow-400/20 hover:scale-105"
                                     : "border-indigo-400/30 bg-indigo-900 opacity-50"
                             }`}
@@ -499,7 +398,7 @@ export default function PlayGame() {
                     {isHumanTurn && selectedChain.length > 0 && (
                         <div className="mb-2 flex justify-center">
                             <button
-                                onClick={playSelectedCards}
+                                onClick={() => send({ type: "playSelectedCards" })}
                                 className="rounded-lg bg-green-600 px-6 py-2 font-semibold text-white shadow-lg shadow-green-600/30 transition-colors hover:bg-green-500"
                             >
                                 Play {selectedChain.length} card
@@ -510,7 +409,7 @@ export default function PlayGame() {
 
                     {/* Human player hand (always visible so you can see your cards) */}
                     {(() => {
-                        const humanPlayer = ctx.players.find((p) => p.id === HUMAN_ID);
+                        const humanPlayer = ctx.players.find((p) => p.id === ctx.humanPlayerId);
                         const humanHand = humanPlayer?.hand ?? [];
                         return (
                             <div className="mt-auto flex flex-col items-center pb-2">
@@ -540,7 +439,13 @@ export default function PlayGame() {
                                                     card={card}
                                                     selected={isSelected}
                                                     playable={isPlayable}
-                                                    onClick={() => isHumanTurn && handleCardClick(card)}
+                                                    onClick={() =>
+                                                        isHumanTurn &&
+                                                        send({
+                                                            type: "toggleSelectCard",
+                                                            cardId: card.id,
+                                                        })
+                                                    }
                                                 />
                                             );
                                         })}

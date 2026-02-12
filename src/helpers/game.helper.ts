@@ -123,12 +123,12 @@ export function buildBestChain(
     return best;
 }
 
+/**
+ * Get the player color mapping for the given player IDs.
+ * Colors are assigned randomly using fischer-yates shuffle, and will cycle if there are more players than colors.
+ */
 export function assignPlayerColors(playerIds: string[]): Record<string, string> {
-    const pool = [...PLAYER_COLORS];
-    for (let i = pool.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [pool[i], pool[j]] = [pool[j], pool[i]];
-    }
+    const pool = shuffle([...PLAYER_COLORS]);
     const map: Record<string, string> = {};
     playerIds.forEach((id, idx) => {
         map[id] = pool[idx % pool.length];

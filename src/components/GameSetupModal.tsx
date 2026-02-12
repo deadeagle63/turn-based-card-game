@@ -1,7 +1,8 @@
 import {type Dispatch, type SetStateAction, useState} from "react";
 import {useNavigate} from "react-router-dom";
 
-import {SUPPORTED_GAME_TIMES} from "../helpers/game.constants.ts";
+import {HUMAN_ID, SUPPORTED_GAME_TIMES} from "../helpers/game.constants.ts";
+import {gameActor} from "../stateMachine/index.ts";
 
 export default function GameSetupModal({onClose}: { onClose: () => void }) {
     const navigate = useNavigate();
@@ -11,9 +12,17 @@ export default function GameSetupModal({onClose}: { onClose: () => void }) {
     );
 
     const handleStart = () => {
-        navigate("/play", {
-            state: {cpuCount, roundTime},
+        gameActor.send({
+            type: "GAME_CONFIG",
+            cpuCount,
+            roundTime,
+            humanPlayerId: HUMAN_ID,
         });
+        const params = new URLSearchParams({
+            cpuCount: String(cpuCount),
+            roundTime: String(roundTime),
+        });
+        navigate(`/play?${params.toString()}`);
     };
 
     return (
