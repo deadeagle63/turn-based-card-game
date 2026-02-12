@@ -502,7 +502,7 @@ export const gameMachine = setup({
             on: {
                 retry: {
                     target: "#game.playing",
-                    actions: "dealGame",
+                    actions: ["markPlayPageMounted", "dealGame"],
                 },
                 quit: {
                     target: "lobby",

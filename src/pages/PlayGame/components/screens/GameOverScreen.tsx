@@ -58,7 +58,10 @@ export function GameOverScreen() {
 
             <div className="flex gap-3">
                 <button
-                    onClick={() => gameActor.send({type: "retry"})}
+                    onClick={() => {
+                        gameActor.send({type: "retry"});
+                        gameActor.send({type: "pageMounted"});
+                    }}
                     className="rounded-lg bg-indigo-600 px-6 py-3 font-semibold text-white shadow-lg shadow-indigo-600/30 transition-colors hover:bg-indigo-500"
                 >
                     Play Again
