@@ -2,6 +2,7 @@ import {getPlayableCards, handValue, orderChain, shuffle} from "../helpers/game.
 import type {Snapshot} from "xstate";
 import type {Card, GameContext, Player, PlayerId} from "./index.ts";
 import {GAME_SNAPSHOT_STORAGE_KEY, type PersistedGameSnapshot} from "./stateMachine.constants.ts";
+import {FALLBACK_PLAYER_COLOR} from "../helpers/game.constants.ts";
 
 /**
  * Get the top card of the discard pile, or undefined if the pile is empty.
@@ -363,4 +364,12 @@ export function hasPersistedGame(): boolean {
     } catch {
         return false;
     }
+}
+
+/**
+ * Get player color from context
+ */
+export function getPlayerColorByPlayerId(ctx: GameContext, playerId?: PlayerId): string {
+   if (!playerId) return FALLBACK_PLAYER_COLOR;
+   return ctx.playerColors[playerId] ?? FALLBACK_PLAYER_COLOR;
 }

@@ -61,7 +61,10 @@ export const PLAYER_COLORS = [
     "#9b59b6", // purple
     "#1abc9c", // teal
 ] as const;
+export const FALLBACK_PLAYER_COLOR = "#6366f1"; // indigo
 
 export const DEFAULT_ROUND_TIME = SUPPORTED_GAME_TIMES["3m"];
 
 export const CARDS_PER_PLAYER = 7;
+
+export const EMPTY_HAND: Card[] = [];

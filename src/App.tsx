@@ -1,6 +1,6 @@
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import MainMenu from "./pages/MainMenu.tsx";
-import PlayGame from "./pages/PlayGame.tsx";
+import PlayGame from "./pages/PlayGame/PlayGame.tsx";
 
 function App() {
   return (
