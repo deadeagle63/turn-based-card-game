@@ -1,17 +1,18 @@
 import {type Dispatch, type SetStateAction, useState} from "react";
 import {useNavigate} from "react-router-dom";
-import {SUPPORTED_GAME_TIMES} from "../helpers/game.helper.ts";
+
+import {SUPPORTED_GAME_TIMES} from "../helpers/game.constants.ts";
 
 export default function GameSetupModal({onClose}: { onClose: () => void }) {
     const navigate = useNavigate();
-    const [playerCount, setPlayerCount] = useState(2);
+    const [cpuCount, setCpuCount] = useState(1);
     const [roundTime, setRoundTime] = useState<number>(
         SUPPORTED_GAME_TIMES["1m"],
     );
 
     const handleStart = () => {
         navigate("/play", {
-            state: {playerCount, roundTime},
+            state: {cpuCount, roundTime},
         });
     };
 
@@ -22,12 +23,12 @@ export default function GameSetupModal({onClose}: { onClose: () => void }) {
 
                 {/* Summary of current selections */}
                 <p className="mb-8 text-center text-sm text-gray-400">
-                    {playerCount}&nbsp;players &middot; {getTimeLabel(roundTime)} per round
+                    You vs {cpuCount}&nbsp;CPU{cpuCount !== 1 ? "s" : ""} &middot; {getTimeLabel(roundTime)} per round
                 </p>
 
-                {/* Player Count */}
-                <OptionSelector label={"Player(s)"} value={playerCount} options={playerCountOptions}
-                                onChange={setPlayerCount}/>
+                {/* CPU Count */}
+                <OptionSelector label={"Opponents"} value={cpuCount} options={cpuCountOptions}
+                                onChange={setCpuCount}/>
 
                 {/* Round Timer */}
                 <OptionSelector label={"Round Timer"} value={roundTime} options={roundTimeEntries}
@@ -90,12 +91,12 @@ function OptionSelector<T>({
     </div>
 }
 
-const playerCountOptions = [
+const cpuCountOptions = [
+    {label: "1", value: 1},
     {label: "2", value: 2},
     {label: "3", value: 3},
     {label: "4", value: 4},
     {label: "5", value: 5},
-    {label: "6", value: 6},
 ] as const;
 
 const roundTimeEntries = Object.entries(SUPPORTED_GAME_TIMES).map(([key, value]) => ({label: key, value}))
